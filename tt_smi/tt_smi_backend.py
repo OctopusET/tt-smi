@@ -8,6 +8,7 @@ This is the backend of tt-smi.
 """
 
 import os
+import pwd
 import re
 import sys
 import time
@@ -125,6 +126,7 @@ class TTSMIBackend:
         self.device_telemetrys = []
         self.chip_limits = []
         self.pci_properties = []
+        self.device_processes = []
 
         if fully_init:
             for i, _ in track(
@@ -346,6 +348,98 @@ class TTSMIBackend:
         for i in self.devices:
             self.smbus_telem_info[i] = self.get_smbus_board_info(i)
             self.device_telemetrys[i] = self.get_chip_telemetry(i)
+
+    def get_device_processes(self):
+        """Scan /proc for processes using tenstorrent devices via fdinfo.
+
+        Aggregates memory across all FDs per (pid, device) pair, like nvtop.
+        """
+        # pid -> (cmdline, user), fetched once per pid
+        pid_meta = {}
+        # (pid, device) -> aggregated entry
+        seen = {}
+
+        for pid_dir in os.listdir("/proc"):
+            if not pid_dir.isdigit():
+                continue
+            pid = int(pid_dir)
+            fd_dir = f"/proc/{pid}/fd"
+            fdinfo_dir = f"/proc/{pid}/fdinfo"
+            try:
+                for fd in os.listdir(fd_dir):
+                    try:
+                        target = os.readlink(f"{fd_dir}/{fd}")
+                    except OSError:
+                        continue
+                    if not target.startswith("/dev/tenstorrent/"):
+                        continue
+                    try:
+                        with open(f"{fdinfo_dir}/{fd}") as f:
+                            info = {}
+                            for line in f:
+                                if line.startswith("tenstorrent-"):
+                                    key, _, val = line.partition(":\t")
+                                    info[key] = val.strip()
+                    except OSError:
+                        continue
+                    if not info:
+                        continue
+
+                    device = int(info.get("tenstorrent-device", -1))
+                    dma = int(info.get("tenstorrent-memory-dmabuf", 0))
+                    pinned = int(info.get("tenstorrent-memory-pinned", 0))
+
+                    key = (pid, device)
+                    if key in seen:
+                        seen[key]["dma_memory"] += dma
+                        seen[key]["pinned_memory"] += pinned
+                    else:
+                        if pid not in pid_meta:
+                            pid_meta[pid] = (self._get_cmdline(pid), self._get_username(pid))
+                        cmdline, user = pid_meta[pid]
+                        seen[key] = {
+                            "pid": pid,
+                            "user": user,
+                            "cmdline": cmdline,
+                            "device": device,
+                            "dma_memory": dma,
+                            "pinned_memory": pinned,
+                        }
+            except OSError:
+                continue
+
+        processes = list(seen.values())
+        processes.sort(key=lambda p: (p["device"], p["pid"]))
+        return processes
+
+    @staticmethod
+    def _get_cmdline(pid):
+        """Read full command line from /proc/[pid]/cmdline."""
+        try:
+            with open(f"/proc/{pid}/cmdline") as f:
+                raw = f.read()
+            if raw:
+                return raw.replace("\0", " ").strip()
+        except OSError:
+            pass
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                return f.read().strip()
+        except OSError:
+            return "?"
+
+    @staticmethod
+    def _get_username(pid):
+        """Get username from /proc/[pid] ownership."""
+        try:
+            uid = os.stat(f"/proc/{pid}").st_uid
+            return pwd.getpwuid(uid).pw_name
+        except (OSError, KeyError):
+            return "?"
+
+    def update_processes(self):
+        """Refresh the list of processes using tenstorrent devices."""
+        self.device_processes = self.get_device_processes()
 
     def get_board_id(self, board_num) -> str:
         """Read board id from CSM or SPI if FW is not loaded"""
