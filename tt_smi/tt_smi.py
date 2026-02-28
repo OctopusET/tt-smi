@@ -774,6 +774,9 @@ def tt_smi_main(backend: TTSMIBackend, args):
             CMD_LINE_COLOR.ENDC,
         )
         sys.exit(0)
+    if not sys.stdout.isatty():
+        backend.print_logs_to_stdout(pretty=False)
+        sys.exit(0)
     tt_smi_app = TTSMI(
         backend=backend,
         snapshot=args.snapshot,
